@@ -6,15 +6,21 @@ import logging
 from os import environ
 from threading import Thread
 from time import sleep
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import ParseMode, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackContext, \
     MessageHandler, Filters, ConversationHandler, CallbackQueryHandler, DispatcherHandlerStop
+from telegram.error import ChatMigrated, BadRequest
 
 log = logging.getLogger(__name__)
 lock = threading.Lock()
 
 SETTINGS_FILENAME = 'settings.json'
+
+# 'addstaff' states
 STATE_CONTACT = 1
+
+# news send states
+STATE_MESSAGE = 1
 
 
 class Global:
@@ -43,16 +49,20 @@ def on_start(update: Update, _: CallbackContext):
     pass
 
 
-def on_group_connect(update: Update, _: CallbackContext):
-    """Subscribes a groups for the news"""
+def on_new_chat_member(update: Update, _: CallbackContext):
+    """When the bot is added to some group, this event is emitted.
+    This event is also emitted when a new user is added to the group with this bot.
+    Subscribes the group to the news"""
 
     with lock:
         g.settings['groups'].append(update.effective_chat.id)
         g.settings_updated = True
 
 
-def on_group_disconnect(update: Update, _: CallbackContext):
-    """Unsubscribes groups from the news"""
+def on_left_chat_member(update: Update, _: CallbackContext):
+    """When the bot is removed from some group, this event is emitted.
+    This event is also emitted when a user left the group with this bot.
+    Unsubscribes the group from the news."""
 
     with lock:
         g.settings['groups'].remove(update.effective_chat.id)
@@ -91,6 +101,19 @@ def make_groups_markup(ctx: CallbackContext, selected_groups: set[int]):
     return InlineKeyboardMarkup(buttons)
 
 
+def make_send_confirm_markup():
+    """Creates inline buttons for confirming news broadcast"""
+
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton('Back', callback_data='confirm-back'),
+         InlineKeyboardButton('Confirm', callback_data='confirm-confirm')
+          ]])
+
+
+CONFIRM_SENDING_TEXT = 'Do you confirm sending news?'
+CHOOSE_GROUPS_TO_SEND_TO_TEXT = 'Send more messages or choose groups to broadcast news to:'
+
+
 def on_message(update: Update, ctx: CallbackContext):
     """Handles news broadcasting"""
 
@@ -112,7 +135,7 @@ def on_message(update: Update, ctx: CallbackContext):
     ctx.user_data['messages'].append(update.message.message_id)
 
     reply_msg = update.message.reply_text(
-        'Send more messages or choose groups to broadcast news to:',
+        CHOOSE_GROUPS_TO_SEND_TO_TEXT,
         reply_markup=make_groups_markup(ctx, ctx.user_data['selected_groups']))
 
     ctx.user_data['reply_msg_id'] = reply_msg.message_id
@@ -128,9 +151,30 @@ def query_callback(update: Update, ctx: CallbackContext):
     if update.callback_query.data == 'cancel':
         update.callback_query.message.edit_text('News broadcast cancelled')
     elif update.callback_query.data == 'send_to_all':
-        groups_to_send_to = g.settings['groups']
+        ctx.bot.edit_message_text(CONFIRM_SENDING_TEXT, update.effective_chat.id,
+                                  ctx.user_data['reply_msg_id'])
+        update.callback_query.message.edit_reply_markup(
+            make_send_confirm_markup())
+        ctx.user_data['send_to_all'] = True
+        return
     elif update.callback_query.data == 'send':
-        groups_to_send_to = selected_groups
+        ctx.bot.edit_message_text(CONFIRM_SENDING_TEXT, update.effective_chat.id,
+                                  ctx.user_data['reply_msg_id'])
+        update.callback_query.message.edit_reply_markup(
+            make_send_confirm_markup())
+        ctx.user_data['send_to_all'] = False
+        return
+    elif update.callback_query.data == 'confirm-back':
+        ctx.bot.edit_message_text(CHOOSE_GROUPS_TO_SEND_TO_TEXT, update.effective_chat.id,
+                                  ctx.user_data['reply_msg_id'])
+        update.callback_query.message.edit_reply_markup(
+            make_groups_markup(ctx, selected_groups))
+        return
+    elif update.callback_query.data == 'confirm-confirm':
+        if ctx.user_data['send_to_all']:
+            groups_to_send_to = g.settings['groups']
+        else:
+            groups_to_send_to = selected_groups
     else:
         group_id = int(update.callback_query.data)
 
@@ -144,8 +188,39 @@ def query_callback(update: Update, ctx: CallbackContext):
         return
 
     for group_id in groups_to_send_to:
+        curr_group_id = group_id
+
         for msg_id in messages:
-            ctx.bot.copy_message(group_id, update.effective_chat.id, msg_id)
+            success = True
+
+            while True:
+                # pylint: disable=bare-except
+                try:
+                    ctx.bot.copy_message(
+                        curr_group_id, update.effective_chat.id, msg_id)
+                except ChatMigrated as err:
+                    with lock:
+                        g.settings['groups'].remove(curr_group_id)
+                        g.settings['groups'].append(err.new_chat_id)
+                        g.settings_updated = True
+                    curr_group_id = err.new_chat_id
+                    # Continue to try again with the new group id
+                    continue
+                except BadRequest:
+                    group = ctx.bot.get_chat(group_id)
+                    update.effective_chat.send_message(
+                        f'Failed to send news to *{group.title}*.'
+                        ' Maybe they blocked sending news from the bot.',
+                        parse_mode=ParseMode.MARKDOWN)
+                    success = False
+                    break
+                except Exception as err:
+                    raise err
+                break
+
+            # If no success with current group then continue to the next group
+            if not success:
+                break
 
     if len(groups_to_send_to) > 0:
         update.callback_query.message.edit_text(
@@ -178,9 +253,9 @@ def add_staff__contact(update: Update, _: CallbackContext):
     return ConversationHandler.END
 
 
-def on_error(update: Update, c: CallbackContext):
+def on_error(update: Update, ctx: CallbackContext):
     """Error handler"""
-    log.exception(c.error)
+    log.exception(ctx.error)
     update.message.reply_text("Server Error happened")
 
 
@@ -204,10 +279,11 @@ updater.dispatcher.add_error_handler(on_error)
 updater.dispatcher.add_handler(CommandHandler('start', on_start))
 
 updater.dispatcher.add_handler(MessageHandler(
-    Filters.status_update.new_chat_members, on_group_connect))
+    Filters.status_update.new_chat_members | Filters.status_update.chat_created,
+    on_new_chat_member))
 
 updater.dispatcher.add_handler(MessageHandler(
-    Filters.status_update.left_chat_member, on_group_disconnect))
+    Filters.status_update.left_chat_member, on_left_chat_member))
 
 updater.dispatcher.add_handler(ConversationHandler(
     entry_points=[CommandHandler('addstaff', add_staff)],
